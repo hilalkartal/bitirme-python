@@ -269,3 +269,172 @@ def update_face_cluster_ids(face_ids: List[int], cluster_ids: List[int]) -> int:
         except Exception:
             pass
         conn.close()
+
+
+# ── persons-related functions ──────────────────────────────────────────
+
+def insert_person(display_name: str, centroid_embedding: np.ndarray) -> int:
+    """Insert a new person row. Returns the person_id."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        emb = np.asarray(centroid_embedding, dtype=np.float32)
+        if emb.ndim != 1 or emb.shape[0] != 512:
+            raise ValueError(f"centroid must be (512,), got {emb.shape}")
+        emb_bytes = emb.tobytes(order="C")
+        cur.execute(
+            "INSERT INTO persons (display_name, centroid_embedding) VALUES (%s, %s)",
+            (display_name, emb_bytes),
+        )
+        person_id = cur.lastrowid
+        conn.commit()
+        return int(person_id)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        conn.close()
+
+
+def fetch_all_person_centroids() -> List[Tuple[int, str, np.ndarray]]:
+    """Returns list of (person_id, display_name, centroid_array) for all persons."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, display_name, centroid_embedding FROM persons")
+        rows = cur.fetchall()
+        result = []
+        for pid, name, blob in rows:
+            emb = np.frombuffer(blob, dtype=np.float32).copy()
+            result.append((int(pid), name, emb))
+        return result
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        conn.close()
+
+
+def update_person_centroid(person_id: int, centroid_embedding: np.ndarray) -> None:
+    """Overwrite the centroid_embedding for an existing person."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        emb = np.asarray(centroid_embedding, dtype=np.float32)
+        emb_bytes = emb.tobytes(order="C")
+        cur.execute(
+            "UPDATE persons SET centroid_embedding = %s WHERE id = %s",
+            (emb_bytes, int(person_id)),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        conn.close()
+
+
+def set_faces_person_id(face_ids: List[int], person_id: int) -> int:
+    """Bulk-set person_id on all given face_ids. Returns affected rowcount."""
+    if not face_ids:
+        return 0
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        data = [(int(person_id), int(fid)) for fid in face_ids]
+        cur.executemany("UPDATE faces SET person_id = %s WHERE id = %s", data)
+        conn.commit()
+        return cur.rowcount
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        conn.close()
+
+
+def set_face_person_id(face_id: int, person_id: int) -> int:
+    """Set person_id on a single face. Returns affected rowcount (0 or 1)."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE faces SET person_id = %s WHERE id = %s",
+            (int(person_id), int(face_id)),
+        )
+        conn.commit()
+        return cur.rowcount
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        conn.close()
+
+
+def fetch_embeddings_by_person_id(person_id: int) -> np.ndarray:
+    """Returns (N, 512) float32 array of all face embeddings for a person."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT embedding FROM faces WHERE person_id = %s", (int(person_id),))
+        rows = cur.fetchall()
+        if not rows:
+            return np.zeros((0, 512), dtype=np.float32)
+        embs = [np.frombuffer(blob, dtype=np.float32).copy() for (blob,) in rows]
+        return np.stack(embs).astype(np.float32)
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        conn.close()
+
+
+def fetch_face_ids_by_image(image_id: int) -> List[Tuple[int, int]]:
+    """Returns [(face_id, face_index), ...] for all faces of an image, sorted by face_index."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, face_index FROM faces WHERE image_id = %s ORDER BY face_index",
+            (int(image_id),),
+        )
+        return [(int(fid), int(fidx)) for fid, fidx in cur.fetchall()]
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        conn.close()
+
+
+def get_person_count() -> int:
+    """Returns total number of rows in the persons table."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM persons")
+        (count,) = cur.fetchone()
+        return int(count)
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        conn.close()

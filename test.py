@@ -54,16 +54,17 @@ def t_save_images_to_db():
 
 
 def t_create_people_folders():
-    """Query clustered faces from DB and copy images into per-cluster folders."""
+    """Query faces with assigned persons and copy images into per-person folders."""
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT f.cluster_id, i.image_path
+            SELECT p.id, p.display_name, i.image_path
             FROM faces f
             JOIN images i ON i.id = f.image_id
-            WHERE f.cluster_id IS NOT NULL AND f.cluster_id != -1
-            ORDER BY f.cluster_id
+            JOIN persons p ON p.id = f.person_id
+            WHERE f.person_id IS NOT NULL
+            ORDER BY p.id
         """)
         rows = cur.fetchall()
     finally:
@@ -74,33 +75,34 @@ def t_create_people_folders():
         conn.close()
 
     if not rows:
-        print("No clustered faces found.")
+        print("No faces with assigned persons found.")
         return
 
-    # Group image filenames by cluster_id
-    clusters = {}
-    for cluster_id, image_path in rows:
-        clusters.setdefault(cluster_id, set()).add(image_path)
+    # Group image filenames by (person_id, display_name)
+    persons = {}
+    for person_id, display_name, image_path in rows:
+        persons.setdefault((person_id, display_name), set()).add(image_path)
 
-    print(f"Found {len(clusters)} cluster(s)\n")
+    print(f"Found {len(persons)} person(s)\n")
 
     # Create output folder (clean start)
     if os.path.exists(OUTPUT_FOLDER):
         shutil.rmtree(OUTPUT_FOLDER)
     os.makedirs(OUTPUT_FOLDER)
 
-    for cluster_id, filenames in sorted(clusters.items()):
-        cluster_dir = os.path.join(OUTPUT_FOLDER, f"cluster_{cluster_id}")
-        os.makedirs(cluster_dir, exist_ok=True)
+    for (person_id, display_name), filenames in sorted(persons.items()):
+        safe_name = display_name.replace(" ", "_")
+        person_dir = os.path.join(OUTPUT_FOLDER, safe_name)
+        os.makedirs(person_dir, exist_ok=True)
 
         for filename in sorted(filenames):
             src = os.path.join(IMAGE_FOLDER, filename)
             if not os.path.isfile(src):
                 print(f"  WARNING: {filename} not found in {IMAGE_FOLDER}")
                 continue
-            shutil.copy2(src, cluster_dir)
+            shutil.copy2(src, person_dir)
 
-        print(f"  cluster_{cluster_id}: {len(filenames)} image(s)")
+        print(f"  {safe_name}: {len(filenames)} image(s)")
 
     print(f"\nDone. Output: {OUTPUT_FOLDER}")
 

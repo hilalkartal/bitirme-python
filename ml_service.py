@@ -5,9 +5,17 @@ import os
 import shutil
 import hashlib
 import numpy as np
+from sklearn.metrics.pairwise import cosine_distances
 
 from repository import upsert_image, insert_faces, FaceRow
-from repository import upsert_image_by_sha1 
+from repository import upsert_image_by_sha1
+from repository import (
+    fetch_all_person_centroids,
+    fetch_face_ids_by_image,
+    set_face_person_id,
+    fetch_embeddings_by_person_id,
+    update_person_centroid,
+)
 
 from person_vs_scenery.haar import HaarDetector
 from person_vs_scenery.hog import HOGDetector
@@ -28,6 +36,28 @@ face_detectors = {
     "mediapipe-face": MediaPipeFaceDetector(),
     "insightface": InsightFaceDetector(ctx_id=-1),  # CPU
 }
+
+PERSON_MATCH_THRESHOLD = 0.35  # cosine distance; matches DBSCAN eps
+
+
+def match_embedding_to_person(embedding, persons):
+    """
+    Compare a face embedding against all person centroids.
+    Returns (person_id, display_name, distance) or (None, None, None).
+    """
+    if not persons:
+        return None, None, None
+
+    centroids = np.stack([p[2] for p in persons])
+    dists = cosine_distances(embedding.reshape(1, -1), centroids)[0]
+    best_idx = int(np.argmin(dists))
+    best_dist = float(dists[best_idx])
+
+    if best_dist < PERSON_MATCH_THRESHOLD:
+        pid, name, _ = persons[best_idx]
+        return pid, name, best_dist
+
+    return None, None, None
 
 
 def _save_upload_to_temp(file: UploadFile) -> str:
@@ -167,12 +197,43 @@ async def ingest_faces(
 
     inserted = insert_faces(image_id=image_id, faces=face_rows, replace_existing=True)
 
+    # 8) Online person matching
+    person_assignments = []
+    if face_rows:
+        persons = fetch_all_person_centroids()
+        face_id_map = fetch_face_ids_by_image(image_id)
+
+        for (face_id, face_index), face_row in zip(face_id_map, face_rows):
+            pid, pname, dist = match_embedding_to_person(face_row.embedding, persons)
+
+            if pid is not None:
+                set_face_person_id(face_id, pid)
+
+                # Recompute centroid with newly assigned face
+                all_embs = fetch_embeddings_by_person_id(pid)
+                new_centroid = all_embs.mean(axis=0)
+                update_person_centroid(pid, new_centroid)
+
+                # Update local cache for subsequent faces in this image
+                for i, (p_id, p_name, _) in enumerate(persons):
+                    if p_id == pid:
+                        persons[i] = (p_id, p_name, new_centroid)
+                        break
+
+            person_assignments.append({
+                "face_index": face_index,
+                "person_id": pid,
+                "display_name": pname,
+                "distance": round(dist, 4) if dist is not None else None,
+            })
+
     return {
         "sha1": sha1,
         "image_id": image_id,
         "image_path": image_path,
         "faces_detected": len(face_rows),
-        "db_rows_affected": inserted
+        "db_rows_affected": inserted,
+        "person_assignments": person_assignments,
     }
 
 @app.post("/ingest-faces-old")
