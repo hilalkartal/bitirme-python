@@ -1,0 +1,23 @@
+# Environments
+.env
+venv/
+ENV/
+
+# Python internal folders
+**/__pycache__/
+*.pyc
+
+# Machine Learning Models
+models/yolov8n.pt
+models/haarcascade_frontalface_default.xml
+
+# Generic rule for all model weights
+*.pt
+*.xml
+*.bin
+*.onnx
+
+
+# IDEs
+.idea/
+.vscode/
