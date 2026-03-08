@@ -135,9 +135,8 @@ async def ingest_faces(
 
     h, w = img.shape[:2]
 
-    # 4) Use stable image_path based on sha1 (prevents duplicates on image_path too)
-    # extension is optional; can keep original extension if you want
-    image_path = f"sha1/{sha1}"
+    # 4) Use original filename as image_path (sha1 column handles dedup)
+    image_path = file.filename or f"sha1/{sha1}"
 
     # 5) Upsert image row by sha1
     image_id = upsert_image_by_sha1(

@@ -21,3 +21,6 @@ models/haarcascade_frontalface_default.xml
 # IDEs
 .idea/
 .vscode/
+
+# Claude / AI Extension Temp Files
+tmpclaude-*
