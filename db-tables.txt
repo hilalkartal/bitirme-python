@@ -1,0 +1,174 @@
+-- =============================================
+-- bitirme_faces - Full Unified Schema
+-- =============================================
+
+-- 1. Users
+CREATE TABLE users (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  email VARCHAR(255) NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  display_name VARCHAR(100) NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_users_email (email)
+) ENGINE=InnoDB;
+
+-- 2. Photos (replaces old 'images' table)
+CREATE TABLE photos (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  user_id BIGINT NOT NULL,                -- who uploaded
+  s3_key VARCHAR(512) NOT NULL,           -- S3 object key
+  original_filename VARCHAR(255),
+  sha1 CHAR(40) NULL,
+  content_type VARCHAR(100),
+  file_size BIGINT NULL,
+  width INT NULL,
+  height INT NULL,
+  -- EXIF fields
+  camera_make VARCHAR(100) NULL,
+  camera_model VARCHAR(100) NULL,
+  software VARCHAR(100) NULL,
+  date_taken TIMESTAMP NULL,
+  orientation INT NULL,
+  exposure_time VARCHAR(50) NULL,
+  aperture VARCHAR(50) NULL,
+  iso INT NULL,
+  focal_length VARCHAR(50) NULL,
+  flash_used BOOLEAN NULL,
+  -- GPS fields
+  latitude DOUBLE NULL,
+  longitude DOUBLE NULL,
+  altitude DOUBLE NULL,
+  formatted_address TEXT NULL,            -- reverse-geocoded address string
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_photos_s3_key (s3_key),
+  UNIQUE KEY uq_photos_sha1 (sha1),
+  KEY idx_photos_user (user_id),
+  KEY idx_photos_date_taken (date_taken),
+  CONSTRAINT fk_photos_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- 3. Albums
+CREATE TABLE albums (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  name VARCHAR(255) NOT NULL,
+  description TEXT NULL,
+  created_by BIGINT NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_albums_created_by (created_by),
+  CONSTRAINT fk_albums_creator FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- 4. Album members (collaboration with roles)
+CREATE TABLE album_members (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  album_id BIGINT NOT NULL,
+  user_id BIGINT NOT NULL,
+  role ENUM('OWNER', 'EDITOR', 'VIEWER') NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_album_member (album_id, user_id),
+  KEY idx_album_members_user (user_id),
+  CONSTRAINT fk_am_album FOREIGN KEY (album_id) REFERENCES albums(id) ON DELETE CASCADE,
+  CONSTRAINT fk_am_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- 5. Album photos (many-to-many)
+CREATE TABLE album_photos (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  album_id BIGINT NOT NULL,
+  photo_id BIGINT NOT NULL,
+  added_by BIGINT NOT NULL,               -- who added this photo to the album
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_album_photo (album_id, photo_id),
+  KEY idx_ap_photo (photo_id),
+  KEY idx_ap_added_by (added_by),
+  CONSTRAINT fk_ap_album FOREIGN KEY (album_id) REFERENCES albums(id) ON DELETE CASCADE,
+  CONSTRAINT fk_ap_photo FOREIGN KEY (photo_id) REFERENCES photos(id) ON DELETE CASCADE,
+  CONSTRAINT fk_ap_user FOREIGN KEY (added_by) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- 6. Persons (face clusters - system-level, no user ownership)
+CREATE TABLE persons (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  display_name VARCHAR(255) NOT NULL,
+  centroid_embedding LONGBLOB NULL,       -- 512 float32 = 2048 bytes
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_persons_display_name (display_name)
+) ENGINE=InnoDB;
+
+-- 7. Faces (individual face detections from ML)
+CREATE TABLE faces (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  photo_id BIGINT NOT NULL,
+  face_index INT NOT NULL,
+  x1 INT NOT NULL,
+  y1 INT NOT NULL,
+  x2 INT NOT NULL,
+  y2 INT NOT NULL,
+  det_score FLOAT NOT NULL,
+  embedding LONGBLOB NOT NULL,            -- 512 float32 = 2048 bytes
+  cluster_id INT NULL,                    -- from DBSCAN (0..n) or -1
+  person_id BIGINT UNSIGNED NULL,                  -- assigned after clustering
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_face_per_photo (photo_id, face_index),
+  KEY idx_faces_photo (photo_id),
+  KEY idx_faces_cluster (cluster_id),
+  KEY idx_faces_person (person_id),
+  CONSTRAINT fk_faces_photo FOREIGN KEY (photo_id) REFERENCES photos(id) ON DELETE CASCADE,
+  CONSTRAINT fk_faces_person FOREIGN KEY (person_id) REFERENCES persons(id) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+-- 8. Tags (manual, per-user, with visibility)
+CREATE TABLE tags (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  photo_id BIGINT NOT NULL,
+  user_id BIGINT NOT NULL,
+  tag_value VARCHAR(255) NOT NULL,
+  visibility ENUM('PUBLIC', 'PRIVATE') NOT NULL DEFAULT 'PRIVATE',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_tag_per_user_photo (photo_id, user_id, tag_value),
+  KEY idx_tags_user (user_id),
+  KEY idx_tags_value (tag_value),
+  CONSTRAINT fk_tags_photo FOREIGN KEY (photo_id) REFERENCES photos(id) ON DELETE CASCADE,
+  CONSTRAINT fk_tags_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- 9. System tags (ML-generated: faces/objects/scenes)
+CREATE TABLE system_tags (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  photo_id BIGINT NOT NULL,
+  tag_type ENUM('PERSON', 'OBJECT', 'SCENE') NOT NULL,
+  tag_value VARCHAR(255) NOT NULL,        -- e.g. "Person 1", "dog", "beach"
+  confidence FLOAT NULL,
+  person_id BIGINT NULL,                  -- only set for PERSON type
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_system_tag (photo_id, tag_type, tag_value),
+  KEY idx_system_tags_photo (photo_id),
+  KEY idx_system_tags_type (tag_type),
+  KEY idx_system_tags_value (tag_value),
+  KEY idx_system_tags_person (person_id),
+  CONSTRAINT fk_st_photo FOREIGN KEY (photo_id) REFERENCES photos(id) ON DELETE CASCADE,
+  CONSTRAINT fk_st_person FOREIGN KEY (person_id) REFERENCES persons(id) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+-- 10. Tag aliases (per-user renames of system tags)
+CREATE TABLE tag_aliases (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  user_id BIGINT NOT NULL,
+  system_tag_id BIGINT NOT NULL,
+  alias_value VARCHAR(255) NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_alias_per_user_tag (user_id, system_tag_id),
+  KEY idx_aliases_system_tag (system_tag_id),
+  CONSTRAINT fk_ta_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  CONSTRAINT fk_ta_system_tag FOREIGN KEY (system_tag_id) REFERENCES system_tags(id) ON DELETE CASCADE
+) ENGINE=InnoDB;

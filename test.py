@@ -59,9 +59,9 @@ def t_create_people_folders():
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT p.id, p.display_name, i.image_path
+            SELECT p.id, p.display_name, ph.original_filename
             FROM faces f
-            JOIN images i ON i.id = f.image_id
+            JOIN photos ph ON ph.id = f.photo_id
             JOIN persons p ON p.id = f.person_id
             WHERE f.person_id IS NOT NULL
             ORDER BY p.id

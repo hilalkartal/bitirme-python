@@ -7,11 +7,11 @@ import hashlib
 import numpy as np
 from sklearn.metrics.pairwise import cosine_distances
 
-from repository import upsert_image, insert_faces, FaceRow
-from repository import upsert_image_by_sha1
+from repository import insert_faces, FaceRow
+from repository import upsert_photo_by_sha1
 from repository import (
     fetch_all_person_centroids,
-    fetch_face_ids_by_image,
+    fetch_face_ids_by_photo,
     set_face_person_id,
     fetch_embeddings_by_person_id,
     update_person_centroid,
@@ -165,15 +165,15 @@ async def ingest_faces(
 
     h, w = img.shape[:2]
 
-    # 4) Use original filename as image_path (sha1 column handles dedup)
-    image_path = file.filename or f"sha1/{sha1}"
+    # 4) Use original filename
+    original_filename = file.filename or f"sha1/{sha1}"
 
-    # 5) Upsert image row by sha1
-    image_id = upsert_image_by_sha1(
+    # 5) Upsert photo row by sha1
+    photo_id = upsert_photo_by_sha1(
         sha1=sha1,
-        image_path=image_path,
+        original_filename=original_filename,
         width=w,
-        height=h
+        height=h,
     )
 
     # 6) Detect faces + embeddings
@@ -195,13 +195,13 @@ async def ingest_faces(
             )
         )
 
-    inserted = insert_faces(image_id=image_id, faces=face_rows, replace_existing=True)
+    inserted = insert_faces(photo_id=photo_id, faces=face_rows, replace_existing=True)
 
     # 8) Online person matching
     person_assignments = []
     if face_rows:
         persons = fetch_all_person_centroids()
-        face_id_map = fetch_face_ids_by_image(image_id)
+        face_id_map = fetch_face_ids_by_photo(photo_id)
 
         for (face_id, face_index), face_row in zip(face_id_map, face_rows):
             pid, pname, dist = match_embedding_to_person(face_row.embedding, persons)
@@ -229,8 +229,8 @@ async def ingest_faces(
 
     return {
         "sha1": sha1,
-        "image_id": image_id,
-        "image_path": image_path,
+        "photo_id": photo_id,
+        "original_filename": original_filename,
         "faces_detected": len(face_rows),
         "db_rows_affected": inserted,
         "person_assignments": person_assignments,
@@ -259,13 +259,13 @@ async def ingest_faces_old(
 
         # Stable-ish key: original filename + uuid
         original = file.filename or "upload.jpg"
-        image_key = f"uploads/{uuid.uuid4().hex}_{original}"
+        s3_key = f"uploads/{uuid.uuid4().hex}_{original}"
 
-        image_id = upsert_image(
-            image_path=image_key,
+        photo_id = upsert_photo_by_sha1(
+            sha1=hashlib.sha1(open(temp_filename, "rb").read()).hexdigest(),
+            original_filename=original,
             width=w,
             height=h,
-            sha1=None,
         )
 
         det = detector.detect(image)
@@ -286,11 +286,11 @@ async def ingest_faces_old(
                 )
             )
 
-        inserted = insert_faces(image_id=image_id, faces=face_rows, replace_existing=True)
+        inserted = insert_faces(photo_id=photo_id, faces=face_rows, replace_existing=True)
 
         return {
-            "image_id": image_id,
-            "image_path": image_key,
+            "photo_id": photo_id,
+            "original_filename": original,
             "faces_detected": len(face_rows),
             "db_rows_affected": inserted,
         }

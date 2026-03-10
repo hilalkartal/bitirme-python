@@ -20,10 +20,17 @@ def _sha1_of_bytes(data: bytes) -> str:
     return hashlib.sha1(data).hexdigest()
 
 
-def upsert_image(image_path: str, width: Optional[int], height: Optional[int], sha1: Optional[str] = None) -> int:
+def upsert_photo(
+    s3_key: str,
+    width: Optional[int],
+    height: Optional[int],
+    sha1: Optional[str] = None,
+    user_id: int = 1,
+    original_filename: Optional[str] = None,
+) -> int:
     """
-    Insert or update images row by unique image_path (and optionally sha1).
-    Returns the image_id.
+    Insert or update photos row by unique s3_key.
+    Returns the photo_id.
     """
     conn = get_conn()
     try:
@@ -31,24 +38,24 @@ def upsert_image(image_path: str, width: Optional[int], height: Optional[int], s
 
         cur.execute(
             """
-            INSERT INTO images (image_path, sha1, width, height)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO photos (user_id, s3_key, original_filename, sha1, width, height)
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
               sha1  = COALESCE(VALUES(sha1), sha1),
               width = VALUES(width),
               height= VALUES(height)
             """,
-            (image_path, sha1, width, height),
+            (user_id, s3_key, original_filename, sha1, width, height),
         )
 
-        cur.execute("SELECT id FROM images WHERE image_path = %s", (image_path,))
+        cur.execute("SELECT id FROM photos WHERE s3_key = %s", (s3_key,))
         row = cur.fetchone()
         if not row:
-            raise RuntimeError("Upsert failed: could not fetch images.id back")
-        (image_id,) = row
+            raise RuntimeError("Upsert failed: could not fetch photos.id back")
+        (photo_id,) = row
 
         conn.commit()
-        return int(image_id)
+        return int(photo_id)
     except Exception:
         conn.rollback()
         raise
@@ -60,10 +67,10 @@ def upsert_image(image_path: str, width: Optional[int], height: Optional[int], s
         conn.close()
 
 
-def insert_faces(image_id: int, faces: Sequence[FaceRow], replace_existing: bool = True) -> int:
+def insert_faces(photo_id: int, faces: Sequence[FaceRow], replace_existing: bool = True) -> int:
     """
-    Inserts face rows for a given image_id.
-    Uses UNIQUE (image_id, face_index).
+    Inserts face rows for a given photo_id.
+    Uses UNIQUE (photo_id, face_index).
     """
     if not faces:
         return 0
@@ -85,7 +92,7 @@ def insert_faces(image_id: int, faces: Sequence[FaceRow], replace_existing: bool
             emb_bytes = emb.tobytes(order="C")
 
             values.append((
-                image_id,
+                photo_id,
                 int(f.face_index),
                 int(x1), int(y1), int(x2), int(y2),
                 float(f.det_score),
@@ -95,7 +102,7 @@ def insert_faces(image_id: int, faces: Sequence[FaceRow], replace_existing: bool
         if replace_existing:
             sql = """
                 INSERT INTO faces
-                  (image_id, face_index, x1, y1, x2, y2, det_score, embedding)
+                  (photo_id, face_index, x1, y1, x2, y2, det_score, embedding)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                 ON DUPLICATE KEY UPDATE
                   x1=VALUES(x1), y1=VALUES(y1), x2=VALUES(x2), y2=VALUES(y2),
@@ -105,7 +112,7 @@ def insert_faces(image_id: int, faces: Sequence[FaceRow], replace_existing: bool
         else:
             sql = """
                 INSERT IGNORE INTO faces
-                  (image_id, face_index, x1, y1, x2, y2, det_score, embedding)
+                  (photo_id, face_index, x1, y1, x2, y2, det_score, embedding)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
             """
 
@@ -143,40 +150,43 @@ def get_face_embedding(face_id: int) -> np.ndarray:
         conn.close()
 
 
-def upsert_image_by_sha1(
+def upsert_photo_by_sha1(
     sha1: str,
-    image_path: str,
+    original_filename: str,
     width: Optional[int],
     height: Optional[int],
+    user_id: int = 1,
 ) -> int:
     """
     Idempotent upsert:
-    - same sha1 => same image row
+    - same sha1 => same photo row
+    - s3_key placeholder uses sha1 until S3 is wired up
     """
+    s3_key = f"local/{sha1}"   # placeholder until S3 integration
     conn = get_conn()
     try:
         cur = conn.cursor()
 
         cur.execute(
             """
-            INSERT INTO images (image_path, sha1, width, height)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO photos (user_id, s3_key, original_filename, sha1, width, height)
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
-              image_path = VALUES(image_path),
-              width = VALUES(width),
+              original_filename = VALUES(original_filename),
+              width  = VALUES(width),
               height = VALUES(height)
             """,
-            (image_path, sha1, width, height),
+            (user_id, s3_key, original_filename, sha1, width, height),
         )
 
-        cur.execute("SELECT id FROM images WHERE sha1 = %s", (sha1,))
+        cur.execute("SELECT id FROM photos WHERE sha1 = %s", (sha1,))
         row = cur.fetchone()
         if not row:
-            raise RuntimeError("Upsert failed: could not fetch images.id by sha1")
-        (image_id,) = row
+            raise RuntimeError("Upsert failed: could not fetch photos.id by sha1")
+        (photo_id,) = row
 
         conn.commit()
-        return int(image_id)
+        return int(photo_id)
     except Exception:
         conn.rollback()
         raise
@@ -406,14 +416,14 @@ def fetch_embeddings_by_person_id(person_id: int) -> np.ndarray:
         conn.close()
 
 
-def fetch_face_ids_by_image(image_id: int) -> List[Tuple[int, int]]:
-    """Returns [(face_id, face_index), ...] for all faces of an image, sorted by face_index."""
+def fetch_face_ids_by_photo(photo_id: int) -> List[Tuple[int, int]]:
+    """Returns [(face_id, face_index), ...] for all faces of a photo, sorted by face_index."""
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, face_index FROM faces WHERE image_id = %s ORDER BY face_index",
-            (int(image_id),),
+            "SELECT id, face_index FROM faces WHERE photo_id = %s ORDER BY face_index",
+            (int(photo_id),),
         )
         return [(int(fid), int(fidx)) for fid, fidx in cur.fetchall()]
     finally:
