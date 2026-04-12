@@ -1,11 +1,19 @@
 from fastapi import FastAPI, UploadFile, File, Query, HTTPException
+from pydantic import BaseModel
 import cv2
 import uuid
 import os
 import shutil
 import hashlib
 import numpy as np
+import urllib.request
+import urllib.error
+import json
+import logging
 from sklearn.metrics.pairwise import cosine_distances
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from repository import insert_faces, FaceRow
 from repository import upsert_photo_by_sha1
@@ -15,6 +23,9 @@ from repository import (
     set_face_person_id,
     fetch_embeddings_by_person_id,
     update_person_centroid,
+    insert_person,
+    get_person_count,
+    count_distinct_photos_for_person,
 )
 
 from person_vs_scenery.haar import HaarDetector
@@ -24,7 +35,11 @@ from person_vs_scenery.yolov8 import YOLOv8Detector
 from face_detectors.mediapipe_face import MediaPipeFaceDetector
 from face_detectors.insightface_face import InsightFaceDetector
 
+logger = logging.getLogger(__name__)
+
 app = FastAPI()
+
+SPRING_API_BASE = os.getenv("SPRING_API_BASE", "http://localhost:8081/bitirme")
 
 face_scenery_detectors = {
     "haar": HaarDetector(),
@@ -235,6 +250,174 @@ async def ingest_faces(
         "db_rows_affected": inserted,
         "person_assignments": person_assignments,
     }
+
+class AnalyzePhotoRequest(BaseModel):
+    photo_id: int          # Spring Boot photo ID — used to post tags back
+    file_path: str         # Absolute OS path to the saved image file
+
+
+def _post_face_tag_to_spring(photo_id: int, person_name: str) -> bool:
+    """
+    POST /photos/{photo_id}/tags to the Spring Boot backend with
+    { "name": person_name, "tagType": "FACE", "source": "SYSTEM" }
+    Returns True on success.
+    """
+    url = f"{SPRING_API_BASE}/photos/{photo_id}/tags"
+    payload = json.dumps({
+        "name": person_name,
+        "tagType": "FACE",
+        "source": "SYSTEM",
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            status = resp.getcode()
+            if status in (200, 201):
+                logger.info("Posted FACE tag '%s' to photo %d", person_name, photo_id)
+                return True
+            logger.warning("Unexpected status %d posting tag to photo %d", status, photo_id)
+            return False
+    except urllib.error.URLError as exc:
+        logger.error("Failed to post tag to Spring Boot: %s", exc)
+        return False
+
+
+@app.post("/analyze-photo")
+async def analyze_photo(req: AnalyzePhotoRequest):
+    """
+    Full auto-tagging pipeline triggered by Spring Boot after a photo upload.
+
+    1. Read image from disk at req.file_path
+    2. Classify as PEOPLE or SCENERY (YOLOv8)
+    3. If SCENERY → return immediately (no tags added)
+    4. If PEOPLE  → detect faces (InsightFace), match to known persons,
+                    create new 'Person N' entries for unknowns,
+                    POST a FACE tag for each unique person back to Spring Boot
+    """
+    img = cv2.imread(req.file_path)
+    if img is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not read image at path: {req.file_path}",
+        )
+
+    # ── 1. Person-vs-scenery classification ────────────────────────────────
+    yolo_detector = face_scenery_detectors["yolov8"]
+    scene_result  = yolo_detector.detect(img)
+    image_type    = "PEOPLE" if scene_result["people"] > 0 else "SCENERY"
+
+    if image_type == "SCENERY":
+        return {
+            "photo_id": req.photo_id,
+            "type": "SCENERY",
+            "action": "skipped",
+            "tags_added": [],
+        }
+
+    # ── 2. Face detection + embedding (InsightFace) ────────────────────────
+    insight_detector = face_detectors["insightface"]
+    det = insight_detector.detect(img)
+    faces = det.get("faces", []) if isinstance(det.get("faces"), list) else []
+
+    if not faces:
+        # Detected as people-photo by YOLO but InsightFace found no faces
+        return {
+            "photo_id": req.photo_id,
+            "type": "PEOPLE",
+            "action": "no_faces_detected",
+            "tags_added": [],
+        }
+
+    # Stable ordering: top-to-bottom, left-to-right
+    faces = sorted(faces, key=lambda f: (f["bbox"][1], f["bbox"][0]))
+
+    # ── 2b. Persist face rows (bbox + embedding) to the faces table ────────
+    face_rows = []
+    for i, f in enumerate(faces):
+        x1, y1, x2, y2 = f["bbox"]
+        face_rows.append(
+            FaceRow(
+                face_index=i,
+                bbox=(int(x1), int(y1), int(x2), int(y2)),
+                det_score=float(f["det_score"]),
+                embedding=f["embedding"],
+            )
+        )
+    insert_faces(photo_id=req.photo_id, faces=face_rows, replace_existing=True)
+
+    # ── 3. Person matching + centroid update ───────────────────────────────
+    persons = fetch_all_person_centroids()   # [(person_id, display_name, centroid_ndarray)]
+    face_id_map = fetch_face_ids_by_photo(req.photo_id)  # [(face_id, face_index), ...]
+    assigned_person_names: list[str] = []
+
+    for (face_id, face_index), face_row in zip(face_id_map, face_rows):
+        embedding = face_row.embedding  # np.float32 (512,)
+        pid, pname, dist = match_embedding_to_person(embedding, persons)
+
+        if pid is not None:
+            # ── Known person: link face → person, update centroid ──────
+            set_face_person_id(face_id, pid)
+
+            all_embs = fetch_embeddings_by_person_id(pid)
+            new_centroid = all_embs.mean(axis=0)
+            update_person_centroid(pid, new_centroid)
+
+            # Update local cache so subsequent faces in same image benefit
+            for i, (p_id, p_name, _) in enumerate(persons):
+                if p_id == pid:
+                    persons[i] = (p_id, p_name, new_centroid)
+                    break
+
+            assigned_person_names.append(pname)
+        else:
+            # ── Unknown person: create a new Person N entry ────────────
+            person_count = get_person_count()
+            new_name = f"Person {person_count + 1}"
+            new_pid = insert_person(display_name=new_name, centroid_embedding=embedding)
+
+            # Link this face to the new person
+            set_face_person_id(face_id, new_pid)
+
+            # Add to local cache so the next face in this image can match it
+            persons.append((new_pid, new_name, embedding.copy()))
+
+            assigned_person_names.append(new_name)
+            logger.info("Created new person '%s' (id=%d)", new_name, new_pid)
+
+    # ── 4. Post a FACE tag only for persons seen in 2+ distinct photos ─────
+    # Background / one-off people stay in the DB for future re-matching
+    # but don't pollute the tag list until they recur.
+    unique_pid_name = list(dict.fromkeys(zip(assigned_person_ids, assigned_person_names)))
+    tags_posted:  list[str] = []
+    tags_skipped: list[str] = []
+
+    for pid, name in unique_pid_name:
+        photo_count = count_distinct_photos_for_person(pid)
+        if photo_count >= 2:
+            ok = _post_face_tag_to_spring(req.photo_id, name)
+            if ok:
+                tags_posted.append(name)
+        else:
+            tags_skipped.append(name)
+            logger.info(
+                "Skipping tag for '%s' (person_id=%d) — only in 1 photo so far", name, pid
+            )
+
+    return {
+        "photo_id": req.photo_id,
+        "type": "PEOPLE",
+        "faces_detected": len(faces),
+        "unique_persons": [n for _, n in unique_pid_name],
+        "tags_added": tags_posted,
+        "tags_skipped_single_appearance": tags_skipped,
+    }
+
 
 @app.post("/ingest-faces-old")
 async def ingest_faces_old(

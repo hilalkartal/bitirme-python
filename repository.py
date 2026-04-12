@@ -448,3 +448,25 @@ def get_person_count() -> int:
         except Exception:
             pass
         conn.close()
+
+
+def count_distinct_photos_for_person(person_id: int) -> int:
+    """
+    Returns the number of distinct photos in which this person has been detected.
+    Used to decide whether to post a tag (only if count >= 2).
+    """
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(DISTINCT photo_id) FROM faces WHERE person_id = %s",
+            (int(person_id),),
+        )
+        (count,) = cur.fetchone()
+        return int(count)
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        conn.close()
