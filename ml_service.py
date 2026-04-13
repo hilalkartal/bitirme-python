@@ -26,6 +26,8 @@ from repository import (
     insert_person,
     get_person_count,
     count_distinct_photos_for_person,
+    get_distinct_photo_ids_for_person,
+    rename_person_display_name,
 )
 
 from person_vs_scenery.haar import HaarDetector
@@ -52,7 +54,7 @@ face_detectors = {
     "insightface": InsightFaceDetector(ctx_id=-1),  # CPU
 }
 
-PERSON_MATCH_THRESHOLD = 0.35  # cosine distance; matches DBSCAN eps
+PERSON_MATCH_THRESHOLD = 0.50  # cosine distance — 0.60 works well for ArcFace across sessions/lighting/angles
 
 
 def match_embedding_to_person(embedding, persons):
@@ -61,12 +63,24 @@ def match_embedding_to_person(embedding, persons):
     Returns (person_id, display_name, distance) or (None, None, None).
     """
     if not persons:
+        logger.debug("match_embedding_to_person: no persons in DB yet")
         return None, None, None
 
     centroids = np.stack([p[2] for p in persons])
     dists = cosine_distances(embedding.reshape(1, -1), centroids)[0]
     best_idx = int(np.argmin(dists))
     best_dist = float(dists[best_idx])
+    best_person = persons[best_idx]
+
+    # Log all candidates so threshold can be tuned by reading the logs
+    logger.info(
+        "Face match — best: '%s' (id=%d) dist=%.4f  threshold=%.2f  [%s]",
+        best_person[1], best_person[0], best_dist, PERSON_MATCH_THRESHOLD,
+        "MATCH" if best_dist < PERSON_MATCH_THRESHOLD else "NO MATCH → new person",
+    )
+    if len(persons) > 1:
+        sorted_matches = sorted(zip(dists, [p[1] for p in persons]))
+        logger.debug("All distances: %s", [(f"{name}: {d:.4f}") for d, name in sorted_matches])
 
     if best_dist < PERSON_MATCH_THRESHOLD:
         pid, name, _ = persons[best_idx]
@@ -251,6 +265,65 @@ async def ingest_faces(
         "person_assignments": person_assignments,
     }
 
+class DebugMatchRequest(BaseModel):
+    file_path: str
+
+
+@app.post("/debug-match")
+async def debug_match(req: DebugMatchRequest):
+    """
+    Detect faces in an image and show cosine distances to every known person.
+    Use this to tune PERSON_MATCH_THRESHOLD without re-uploading photos.
+    """
+    img = cv2.imread(req.file_path)
+    if img is None:
+        raise HTTPException(status_code=400, detail=f"Cannot read image: {req.file_path}")
+
+    det = face_detectors["insightface"].detect(img)
+    faces = det.get("faces", []) if isinstance(det.get("faces"), list) else []
+    persons = fetch_all_person_centroids()
+
+    results = []
+    for i, f in enumerate(faces):
+        emb = f["embedding"]
+        if not persons:
+            results.append({"face_index": i, "matches": []})
+            continue
+        centroids = np.stack([p[2] for p in persons])
+        dists = cosine_distances(emb.reshape(1, -1), centroids)[0]
+        matches = sorted([
+            {"person_id": persons[j][0], "name": persons[j][1], "distance": round(float(dists[j]), 4)}
+            for j in range(len(persons))
+        ], key=lambda x: x["distance"])
+        results.append({"face_index": i, "matches": matches})
+
+    return {
+        "faces_detected": len(faces),
+        "threshold": PERSON_MATCH_THRESHOLD,
+        "faces": results,
+    }
+
+
+class RenamePersonRequest(BaseModel):
+    old_name: str   # current display_name in Python persons table (e.g. "Person 2")
+    new_name: str   # new name chosen by user (e.g. "Selin")
+
+
+@app.post("/rename-person")
+async def rename_person(req: RenamePersonRequest):
+    """
+    Called by Spring Boot whenever a FACE tag is renamed.
+    Keeps Python's persons.display_name in sync so future uploads
+    post the correct (user-chosen) name instead of the stale "Person N".
+    """
+    if not req.old_name or not req.new_name:
+        raise HTTPException(status_code=400, detail="old_name and new_name must not be empty")
+
+    updated = rename_person_display_name(req.old_name, req.new_name)
+    logger.info("rename-person: '%s' → '%s' (%d row(s) updated)", req.old_name, req.new_name, updated)
+    return {"old_name": req.old_name, "new_name": req.new_name, "rows_updated": updated}
+
+
 class AnalyzePhotoRequest(BaseModel):
     photo_id: int          # Spring Boot photo ID — used to post tags back
     file_path: str         # Absolute OS path to the saved image file
@@ -354,7 +427,7 @@ async def analyze_photo(req: AnalyzePhotoRequest):
     # ── 3. Person matching + centroid update ───────────────────────────────
     persons = fetch_all_person_centroids()   # [(person_id, display_name, centroid_ndarray)]
     face_id_map = fetch_face_ids_by_photo(req.photo_id)  # [(face_id, face_index), ...]
-    assigned_person_names: list[str] = []
+    assigned_persons: list[tuple[int, str]] = []  # (person_id, name) per face
 
     for (face_id, face_index), face_row in zip(face_id_map, face_rows):
         embedding = face_row.embedding  # np.float32 (512,)
@@ -374,7 +447,7 @@ async def analyze_photo(req: AnalyzePhotoRequest):
                     persons[i] = (p_id, p_name, new_centroid)
                     break
 
-            assigned_person_names.append(pname)
+            assigned_persons.append((pid, pname))
         else:
             # ── Unknown person: create a new Person N entry ────────────
             person_count = get_person_count()
@@ -387,22 +460,29 @@ async def analyze_photo(req: AnalyzePhotoRequest):
             # Add to local cache so the next face in this image can match it
             persons.append((new_pid, new_name, embedding.copy()))
 
-            assigned_person_names.append(new_name)
+            assigned_persons.append((new_pid, new_name))
             logger.info("Created new person '%s' (id=%d)", new_name, new_pid)
 
     # ── 4. Post a FACE tag only for persons seen in 2+ distinct photos ─────
-    # Background / one-off people stay in the DB for future re-matching
-    # but don't pollute the tag list until they recur.
-    unique_pid_name = list(dict.fromkeys(zip(assigned_person_ids, assigned_person_names)))
+    # When the threshold is first crossed (exactly 2 photos), retroactively
+    # tag ALL photos this person appears in — not just the current one.
+    # Spring Boot deduplicates so re-posting to an already-tagged photo is safe.
+    unique_pid_name = list(dict.fromkeys(assigned_persons))  # dedupe, preserve order
     tags_posted:  list[str] = []
     tags_skipped: list[str] = []
 
     for pid, name in unique_pid_name:
         photo_count = count_distinct_photos_for_person(pid)
         if photo_count >= 2:
-            ok = _post_face_tag_to_spring(req.photo_id, name)
-            if ok:
-                tags_posted.append(name)
+            # Tag every photo this person appears in (handles retroactive tagging)
+            all_photo_ids = get_distinct_photo_ids_for_person(pid)
+            for photo_id in all_photo_ids:
+                ok = _post_face_tag_to_spring(photo_id, name)
+                if ok and photo_id == req.photo_id:
+                    tags_posted.append(name)
+            logger.info(
+                "Tagged '%s' (person_id=%d) across %d photo(s)", name, pid, len(all_photo_ids)
+            )
         else:
             tags_skipped.append(name)
             logger.info(

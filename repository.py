@@ -435,13 +435,65 @@ def fetch_face_ids_by_photo(photo_id: int) -> List[Tuple[int, int]]:
 
 
 def get_person_count() -> int:
-    """Returns total number of rows in the persons table."""
+    """
+    Returns MAX(id) from the persons table so that new person names
+    (Person N+1) never collide with existing ones even after deletions.
+    Returns 0 if the table is empty.
+    """
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM persons")
-        (count,) = cur.fetchone()
-        return int(count)
+        cur.execute("SELECT COALESCE(MAX(id), 0) FROM persons")
+        (max_id,) = cur.fetchone()
+        return int(max_id)
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        conn.close()
+
+
+def get_distinct_photo_ids_for_person(person_id: int) -> List[int]:
+    """
+    Returns all distinct photo_ids where this person has a detected face.
+    Used for retroactive tagging when a person crosses the 2-photo threshold.
+    """
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT DISTINCT photo_id FROM faces WHERE person_id = %s",
+            (int(person_id),),
+        )
+        return [int(row[0]) for row in cur.fetchall()]
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        conn.close()
+
+
+def rename_person_display_name(old_name: str, new_name: str) -> int:
+    """
+    Update display_name for all persons matching old_name.
+    Called when a FACE tag is renamed in Spring Boot so that Python's
+    persons table stays in sync.
+    Returns the number of rows updated (0 = not found, 1+ = updated).
+    """
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE persons SET display_name = %s WHERE display_name = %s",
+            (new_name, old_name),
+        )
+        conn.commit()
+        return cur.rowcount
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         try:
             cur.close()
