@@ -37,6 +37,8 @@ from person_vs_scenery.yolov8 import YOLOv8Detector
 from face_detectors.mediapipe_face import MediaPipeFaceDetector
 from face_detectors.insightface_face import InsightFaceDetector
 
+from scenery_classifiers.places365_classifier import Places365Classifier
+
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
@@ -53,6 +55,10 @@ face_detectors = {
     "mediapipe-face": MediaPipeFaceDetector(),
     "insightface": InsightFaceDetector(ctx_id=-1),  # CPU
 }
+
+# Lazy-loaded — model is only instantiated on first scenery image.
+# Keeps RAM at zero cost for people-only sessions.
+scenery_classifier = Places365Classifier()
 
 PERSON_MATCH_THRESHOLD = 0.50  # cosine distance — 0.60 works well for ArcFace across sessions/lighting/angles
 
@@ -361,6 +367,40 @@ def _post_face_tag_to_spring(photo_id: int, person_name: str) -> bool:
         return False
 
 
+def _post_place_tag_to_spring(photo_id: int, place_name: str) -> bool:
+    """
+    POST /photos/{photo_id}/tags to the Spring Boot backend with
+    { "name": place_name, "tagType": "PLACE", "source": "SYSTEM" }
+    Returns True on success.
+    """
+    url = f"{SPRING_API_BASE}/photos/{photo_id}/tags"
+    payload = json.dumps({
+        "name": place_name,
+        "tagType": "PLACE",
+        "source": "SYSTEM",
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            status = resp.getcode()
+            if status in (200, 201):
+                logger.info("Posted PLACE tag '%s' to photo %d", place_name, photo_id)
+                return True
+            logger.warning(
+                "Unexpected status %d posting PLACE tag to photo %d", status, photo_id
+            )
+            return False
+    except urllib.error.URLError as exc:
+        logger.error("Failed to post PLACE tag to Spring Boot: %s", exc)
+        return False
+
+
 @app.post("/analyze-photo")
 async def analyze_photo(req: AnalyzePhotoRequest):
     """
@@ -368,7 +408,8 @@ async def analyze_photo(req: AnalyzePhotoRequest):
 
     1. Read image from disk at req.file_path
     2. Classify as PEOPLE or SCENERY (YOLOv8)
-    3. If SCENERY → return immediately (no tags added)
+    3. If SCENERY → run MobileNetV2 Places365 scene classifier,
+                    POST top-3 PLACE tags back to Spring Boot
     4. If PEOPLE  → detect faces (InsightFace), match to known persons,
                     create new 'Person N' entries for unknowns,
                     POST a FACE tag for each unique person back to Spring Boot
@@ -386,11 +427,21 @@ async def analyze_photo(req: AnalyzePhotoRequest):
     image_type    = "PEOPLE" if scene_result["people"] > 0 else "SCENERY"
 
     if image_type == "SCENERY":
+        # ── Scenery branch: classify scene and post PLACE tags ─────────────
+        scene_tags = scenery_classifier.classify(img, top_k=3, min_confidence=0.10)
+
+        place_tags_posted: list[str] = []
+        for tag in scene_tags:
+            ok = _post_place_tag_to_spring(req.photo_id, tag["label"])
+            if ok:
+                place_tags_posted.append(tag["label"])
+
         return {
             "photo_id": req.photo_id,
             "type": "SCENERY",
-            "action": "skipped",
-            "tags_added": [],
+            "action": "tagged",
+            "scene_predictions": scene_tags,       # full label + confidence list
+            "tags_added": place_tags_posted,
         }
 
     # ── 2. Face detection + embedding (InsightFace) ────────────────────────
