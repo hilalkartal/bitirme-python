@@ -478,8 +478,8 @@ def get_distinct_photo_ids_for_person(person_id: int) -> List[int]:
 def rename_person_display_name(old_name: str, new_name: str) -> int:
     """
     Update display_name for all persons matching old_name.
-    Called when a FACE tag is renamed in Spring Boot so that Python's
-    persons table stays in sync.
+    NOTE: kept for backward-compatibility. The per-user rename flow now
+    uses `upsert_person_user_label` so face names can differ per user.
     Returns the number of rows updated (0 = not found, 1+ = updated).
     """
     conn = get_conn()
@@ -494,6 +494,111 @@ def rename_person_display_name(old_name: str, new_name: str) -> int:
     except Exception:
         conn.rollback()
         raise
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        conn.close()
+
+
+# ── Per-user labels for face clusters ───────────────────────────────────
+# Same face cluster (persons.id) can have different names per user
+# (e.g. user A: "Mom", user B: "Aunt"). Stored in person_user_label.
+
+def fetch_user_label(person_id: int, user_id: int) -> Optional[str]:
+    """Returns this user's chosen label for a person cluster, or None if not set."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT label FROM person_user_label WHERE person_id = %s AND user_id = %s",
+            (int(person_id), int(user_id)),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        conn.close()
+
+
+def upsert_person_user_label(person_id: int, user_id: int, label: str) -> None:
+    """Insert or update the per-user label for a face cluster."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO person_user_label (person_id, user_id, label)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE label = VALUES(label)
+            """,
+            (int(person_id), int(user_id), label),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        conn.close()
+
+
+def find_person_id_by_user_label(user_id: int, label: str) -> Optional[int]:
+    """Find the person_id whose label for this user matches `label`."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT person_id FROM person_user_label WHERE user_id = %s AND label = %s LIMIT 1",
+            (int(user_id), label),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row else None
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        conn.close()
+
+
+def find_person_id_by_display_name(display_name: str) -> Optional[int]:
+    """Fallback: find a person by global display_name (e.g. 'Person 3')."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id FROM persons WHERE display_name = %s LIMIT 1",
+            (display_name,),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row else None
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        conn.close()
+
+
+def fetch_photo_owner(photo_id: int) -> Optional[int]:
+    """Return owner_user_id for a given photo from the Spring-managed `photo` table."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT owner_user_id FROM photo WHERE id = %s",
+            (int(photo_id),),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row and row[0] is not None else None
     finally:
         try:
             cur.close()

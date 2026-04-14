@@ -28,6 +28,11 @@ from repository import (
     count_distinct_photos_for_person,
     get_distinct_photo_ids_for_person,
     rename_person_display_name,
+    fetch_user_label,
+    upsert_person_user_label,
+    find_person_id_by_user_label,
+    find_person_id_by_display_name,
+    fetch_photo_owner,
 )
 
 from person_vs_scenery.haar import HaarDetector
@@ -311,34 +316,68 @@ async def debug_match(req: DebugMatchRequest):
 
 
 class RenamePersonRequest(BaseModel):
-    old_name: str   # current display_name in Python persons table (e.g. "Person 2")
+    old_name: str   # current label from this user's perspective (e.g. "Person 2" or "Mom")
     new_name: str   # new name chosen by user (e.g. "Selin")
+    user_id: int    # which user is renaming — labels are per-user
 
 
 @app.post("/rename-person")
 async def rename_person(req: RenamePersonRequest):
     """
-    Called by Spring Boot whenever a FACE tag is renamed.
-    Keeps Python's persons.display_name in sync so future uploads
-    post the correct (user-chosen) name instead of the stale "Person N".
+    Called by Spring Boot whenever a FACE tag is renamed by a user.
+
+    Labels are per-user (stored in person_user_label). We locate the
+    cluster by either (a) this user's existing label, or (b) the global
+    persons.display_name if they haven't set a label yet — and then
+    upsert the new label on the `person_user_label` table.
     """
     if not req.old_name or not req.new_name:
         raise HTTPException(status_code=400, detail="old_name and new_name must not be empty")
+    if req.user_id is None:
+        raise HTTPException(status_code=400, detail="user_id is required")
 
-    updated = rename_person_display_name(req.old_name, req.new_name)
-    logger.info("rename-person: '%s' → '%s' (%d row(s) updated)", req.old_name, req.new_name, updated)
-    return {"old_name": req.old_name, "new_name": req.new_name, "rows_updated": updated}
+    # 1. Try: this user already has a label matching old_name → find its person_id
+    person_id = find_person_id_by_user_label(req.user_id, req.old_name)
+
+    # 2. Fallback: they're renaming the default display_name (e.g. "Person 3")
+    if person_id is None:
+        person_id = find_person_id_by_display_name(req.old_name)
+
+    if person_id is None:
+        logger.warning("rename-person: no person found for user=%d old_name='%s'",
+                       req.user_id, req.old_name)
+        return {
+            "user_id": req.user_id,
+            "old_name": req.old_name,
+            "new_name": req.new_name,
+            "person_id": None,
+            "updated": False,
+        }
+
+    upsert_person_user_label(person_id=person_id, user_id=req.user_id, label=req.new_name)
+    logger.info("rename-person: user=%d '%s' → '%s' on person_id=%d",
+                req.user_id, req.old_name, req.new_name, person_id)
+
+    return {
+        "user_id": req.user_id,
+        "old_name": req.old_name,
+        "new_name": req.new_name,
+        "person_id": person_id,
+        "updated": True,
+    }
 
 
 class AnalyzePhotoRequest(BaseModel):
     photo_id: int          # Spring Boot photo ID — used to post tags back
     file_path: str         # Absolute OS path to the saved image file
+    owner_user_id: int     # Who owns this photo — used as X-User-Id when posting tags back
 
 
-def _post_face_tag_to_spring(photo_id: int, person_name: str) -> bool:
+def _post_face_tag_to_spring(photo_id: int, person_name: str, user_id: int) -> bool:
     """
     POST /photos/{photo_id}/tags to the Spring Boot backend with
     { "name": person_name, "tagType": "FACE", "source": "SYSTEM" }
+    on behalf of user_id (sent via X-User-Id header).
     Returns True on success.
     """
     url = f"{SPRING_API_BASE}/photos/{photo_id}/tags"
@@ -351,26 +390,31 @@ def _post_face_tag_to_spring(photo_id: int, person_name: str) -> bool:
     req = urllib.request.Request(
         url,
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "X-User-Id": str(user_id),
+        },
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             status = resp.getcode()
             if status in (200, 201):
-                logger.info("Posted FACE tag '%s' to photo %d", person_name, photo_id)
+                logger.info("Posted FACE tag '%s' to photo %d (user=%d)", person_name, photo_id, user_id)
                 return True
-            logger.warning("Unexpected status %d posting tag to photo %d", status, photo_id)
+            logger.warning("Unexpected status %d posting FACE tag to photo %d (user=%d)",
+                           status, photo_id, user_id)
             return False
     except urllib.error.URLError as exc:
-        logger.error("Failed to post tag to Spring Boot: %s", exc)
+        logger.error("Failed to post FACE tag to Spring Boot (user=%d): %s", user_id, exc)
         return False
 
 
-def _post_place_tag_to_spring(photo_id: int, place_name: str) -> bool:
+def _post_place_tag_to_spring(photo_id: int, place_name: str, user_id: int) -> bool:
     """
     POST /photos/{photo_id}/tags to the Spring Boot backend with
     { "name": place_name, "tagType": "PLACE", "source": "SYSTEM" }
+    on behalf of user_id (sent via X-User-Id header).
     Returns True on success.
     """
     url = f"{SPRING_API_BASE}/photos/{photo_id}/tags"
@@ -383,22 +427,32 @@ def _post_place_tag_to_spring(photo_id: int, place_name: str) -> bool:
     req = urllib.request.Request(
         url,
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "X-User-Id": str(user_id),
+        },
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             status = resp.getcode()
             if status in (200, 201):
-                logger.info("Posted PLACE tag '%s' to photo %d", place_name, photo_id)
+                logger.info("Posted PLACE tag '%s' to photo %d (user=%d)", place_name, photo_id, user_id)
                 return True
             logger.warning(
-                "Unexpected status %d posting PLACE tag to photo %d", status, photo_id
+                "Unexpected status %d posting PLACE tag to photo %d (user=%d)",
+                status, photo_id, user_id,
             )
             return False
     except urllib.error.URLError as exc:
-        logger.error("Failed to post PLACE tag to Spring Boot: %s", exc)
+        logger.error("Failed to post PLACE tag to Spring Boot (user=%d): %s", user_id, exc)
         return False
+
+
+def _label_for(person_id: int, fallback_display_name: str, user_id: int) -> str:
+    """Resolve this user's chosen label for a face cluster, or fall back to the global display name."""
+    label = fetch_user_label(person_id, user_id)
+    return label if label else fallback_display_name
 
 
 @app.post("/analyze-photo")
@@ -432,7 +486,7 @@ async def analyze_photo(req: AnalyzePhotoRequest):
 
         place_tags_posted: list[str] = []
         for tag in scene_tags:
-            ok = _post_place_tag_to_spring(req.photo_id, tag["label"])
+            ok = _post_place_tag_to_spring(req.photo_id, tag["label"], req.owner_user_id)
             if ok:
                 place_tags_posted.append(tag["label"])
 
@@ -517,32 +571,48 @@ async def analyze_photo(req: AnalyzePhotoRequest):
     # ── 4. Post a FACE tag only for persons seen in 2+ distinct photos ─────
     # When the threshold is first crossed (exactly 2 photos), retroactively
     # tag ALL photos this person appears in — not just the current one.
-    # Spring Boot deduplicates so re-posting to an already-tagged photo is safe.
+    # Each photo is tagged on behalf of that photo's OWNER (who might not
+    # be the current uploader), and the tag name is THAT owner's
+    # per-user label (fallback: global display_name).
+    # Spring Boot deduplicates so re-posting an existing tag is safe.
     unique_pid_name = list(dict.fromkeys(assigned_persons))  # dedupe, preserve order
     tags_posted:  list[str] = []
     tags_skipped: list[str] = []
 
-    for pid, name in unique_pid_name:
+    for pid, default_name in unique_pid_name:
         photo_count = count_distinct_photos_for_person(pid)
         if photo_count >= 2:
-            # Tag every photo this person appears in (handles retroactive tagging)
             all_photo_ids = get_distinct_photo_ids_for_person(pid)
             for photo_id in all_photo_ids:
-                ok = _post_face_tag_to_spring(photo_id, name)
+                # Who owns this photo? Tag is posted on their behalf.
+                photo_owner = fetch_photo_owner(photo_id)
+                if photo_owner is None:
+                    # Fallback to current uploader if the owner row is missing
+                    photo_owner = req.owner_user_id
+
+                # Resolve this user's label for the cluster
+                label = _label_for(pid, default_name, photo_owner)
+
+                ok = _post_face_tag_to_spring(photo_id, label, photo_owner)
                 if ok and photo_id == req.photo_id:
-                    tags_posted.append(name)
+                    tags_posted.append(label)
             logger.info(
-                "Tagged '%s' (person_id=%d) across %d photo(s)", name, pid, len(all_photo_ids)
+                "Tagged cluster person_id=%d across %d photo(s) (default='%s')",
+                pid, len(all_photo_ids), default_name,
             )
         else:
-            tags_skipped.append(name)
+            # Skip tag but still surface this user's label if they already renamed it
+            own_label = _label_for(pid, default_name, req.owner_user_id)
+            tags_skipped.append(own_label)
             logger.info(
-                "Skipping tag for '%s' (person_id=%d) — only in 1 photo so far", name, pid
+                "Skipping tag for person_id=%d ('%s') — only in 1 photo so far",
+                pid, own_label,
             )
 
     return {
         "photo_id": req.photo_id,
         "type": "PEOPLE",
+        "owner_user_id": req.owner_user_id,
         "faces_detected": len(faces),
         "unique_persons": [n for _, n in unique_pid_name],
         "tags_added": tags_posted,
