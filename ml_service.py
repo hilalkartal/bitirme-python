@@ -583,22 +583,28 @@ async def analyze_photo(req: AnalyzePhotoRequest):
         photo_count = count_distinct_photos_for_person(pid)
         if photo_count >= 2:
             all_photo_ids = get_distinct_photo_ids_for_person(pid)
-            for photo_id in all_photo_ids:
-                # Who owns this photo? Tag is posted on their behalf.
-                photo_owner = fetch_photo_owner(photo_id)
-                if photo_owner is None:
-                    # Fallback to current uploader if the owner row is missing
-                    photo_owner = req.owner_user_id
+            for p_id in all_photo_ids:
+                # For the photo currently being analyzed on behalf of a collaborative
+                # album member (req.owner_user_id), always post the tag for that member —
+                # NOT for the photo's actual file owner, who may be a different user.
+                # For all other photos in the cluster (retroactive tagging), post on
+                # behalf of the photo's actual owner as usual.
+                if p_id == req.photo_id:
+                    tag_user_id = req.owner_user_id
+                else:
+                    tag_user_id = fetch_photo_owner(p_id)
+                    if tag_user_id is None:
+                        tag_user_id = req.owner_user_id
 
                 # Resolve this user's label for the cluster
-                label = _label_for(pid, default_name, photo_owner)
+                label = _label_for(pid, default_name, tag_user_id)
 
-                ok = _post_face_tag_to_spring(photo_id, label, photo_owner)
-                if ok and photo_id == req.photo_id:
+                ok = _post_face_tag_to_spring(p_id, label, tag_user_id)
+                if ok and p_id == req.photo_id:
                     tags_posted.append(label)
             logger.info(
-                "Tagged cluster person_id=%d across %d photo(s) (default='%s')",
-                pid, len(all_photo_ids), default_name,
+                "Tagged cluster person_id=%d across %d photo(s) (default='%s') for user=%d",
+                pid, len(all_photo_ids), default_name, req.owner_user_id,
             )
         else:
             # Skip tag but still surface this user's label if they already renamed it
